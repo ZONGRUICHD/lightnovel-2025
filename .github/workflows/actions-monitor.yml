@@ -1,4 +1,4 @@
-name: Snapshot Actions status
+name: Snapshot Actions status and repository inventory
 
 on:
   push:
@@ -14,11 +14,11 @@ permissions:
 jobs:
   snapshot:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
-      - name: Capture workflow runs
+      - name: Capture workflow runs and EPUB inventory
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -49,12 +49,33 @@ jobs:
             }]
           }' "$RUNNER_TEMP/runs.json" > actions-snapshot.json
 
-      - name: Commit snapshot to monitor branch
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path('.')
+          epubs = sorted(root.rglob('*.epub'))
+          sizes = [p.stat().st_size for p in epubs]
+          inventory = {
+              'total_epubs': len(epubs),
+              'total_bytes': sum(sizes),
+              'smallest_bytes': min(sizes) if sizes else 0,
+              'largest_bytes': max(sizes) if sizes else 0,
+              'first_files': [p.as_posix() for p in epubs[:10]],
+              'last_files': [p.as_posix() for p in epubs[-10:]],
+          }
+          Path('repo-inventory.json').write_text(
+              json.dumps(inventory, ensure_ascii=False, indent=2) + '\n',
+              encoding='utf-8',
+          )
+          PY
+
+      - name: Commit snapshots to monitor branch
         shell: bash
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add actions-snapshot.json
-          git commit -m "chore: snapshot Actions status [skip ci]"
+          git add actions-snapshot.json repo-inventory.json
+          git commit -m "chore: snapshot Actions status and EPUB inventory [skip ci]"
           git push origin "HEAD:automation-monitor"
