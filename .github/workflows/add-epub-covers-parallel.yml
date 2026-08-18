@@ -1,0 +1,114 @@
+name: Embed covers into EPUB files (parallel candidate)
+
+on:
+  push:
+    branches:
+      - cover-parallel
+    paths:
+      - ".github/workflows/add-epub-covers-parallel.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: epub-cover-parallel-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  enrich-parallel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies and CJK fonts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check "Pillow>=10,<12" "requests>=2.31,<3"
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends fonts-noto-cjk
+
+      - name: Restore and verify processors
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat scripts/.payload/add_epub_covers.py.gz.b64.part-* \
+            | base64 --decode \
+            | gzip --decompress > "$RUNNER_TEMP/add_epub_covers.py"
+          cat scripts/.payload/run_epub_covers_parallel.py.gz.b64 \
+            | base64 --decode \
+            | gzip --decompress > "$RUNNER_TEMP/run_epub_covers_parallel.py"
+          echo "5e83742a993d695afe3940e3f45766d1f5327bc38e8d85b9df347abfd9d8130d  $RUNNER_TEMP/add_epub_covers.py" \
+            | sha256sum --check
+          echo "d9d9c6fb2690360528a06cbee8739a084a3a12aa70b297b5aa44ea6b6da1c886  $RUNNER_TEMP/run_epub_covers_parallel.py" \
+            | sha256sum --check
+          python -m py_compile "$RUNNER_TEMP/add_epub_covers.py" "$RUNNER_TEMP/run_epub_covers_parallel.py"
+
+      - name: Resolve, embed, and validate covers with four workers
+        shell: bash
+        run: |
+          set -euo pipefail
+          python "$RUNNER_TEMP/run_epub_covers_parallel.py" \
+            --processor "$RUNNER_TEMP/add_epub_covers.py" \
+            --root "$GITHUB_WORKSPACE" \
+            --report cover-report.json \
+            --workers 4 2>&1 | tee cover-run-parallel.log
+
+      - name: Commit EPUB updates and report to candidate branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          SUMMARY="$(jq -r '"\(.summary.modified_epubs)/\(.summary.total_epubs) modified, \(.summary.errors) errors"' cover-report.json)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config http.postBuffer 524288000
+          git add -A -- '*.epub' cover-report.json
+          if git diff --cached --quiet; then
+            echo "No EPUB changes to commit."
+          else
+            git commit -m "feat(epub): embed and validate covers in parallel (${SUMMARY}) [skip ci]"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+
+      - name: Upload candidate report and log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: epub-cover-parallel-report
+          path: |
+            cover-report.json
+            cover-run-parallel.log
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Fail if any EPUB could not be processed
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import pathlib
+
+          path = pathlib.Path("cover-report.json")
+          if not path.exists():
+              raise SystemExit("cover-report.json is missing")
+          report = json.loads(path.read_text(encoding="utf-8"))
+          errors = report["summary"]["errors"]
+          if errors:
+              for book in report["books"]:
+                  if book.get("error"):
+                      print(f'{book["file"]}: {book["error"]}')
+              raise SystemExit(f"{errors} EPUB files failed")
+          print("All EPUB files processed and validated.")
+          PY
