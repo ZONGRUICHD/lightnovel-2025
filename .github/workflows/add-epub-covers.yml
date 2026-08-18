@@ -1,0 +1,114 @@
+name: Embed covers into EPUB files
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/add-epub-covers.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: epub-cover-enrichment-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  enrich:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies and CJK fonts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check "Pillow>=10,<12" "requests>=2.31,<3"
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends fonts-noto-cjk
+
+      - name: Restore and verify processor
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat scripts/.payload/add_epub_covers.py.gz.b64.part-* \
+            | base64 --decode \
+            | gzip --decompress > "$RUNNER_TEMP/add_epub_covers.py"
+          echo "5e83742a993d695afe3940e3f45766d1f5327bc38e8d85b9df347abfd9d8130d  $RUNNER_TEMP/add_epub_covers.py" \
+            | sha256sum --check
+          python -m py_compile "$RUNNER_TEMP/add_epub_covers.py"
+
+      - name: Resolve, embed, and validate covers
+        shell: bash
+        run: |
+          set -euo pipefail
+          python "$RUNNER_TEMP/add_epub_covers.py" \
+            --root "$GITHUB_WORKSPACE" \
+            --report cover-report.json 2>&1 | tee cover-run.log
+
+      - name: Commit EPUB updates and report
+        shell: bash
+        run: |
+          set -euo pipefail
+          SUMMARY="$(python - <<'PY'
+          import json
+          with open("cover-report.json", encoding="utf-8") as handle:
+              summary = json.load(handle)["summary"]
+          print(f'{summary["modified_epubs"]}/{summary["total_epubs"]} modified, {summary["errors"]} errors')
+          PY
+          )"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config http.postBuffer 524288000
+          git add -A -- '*.epub' cover-report.json
+          if git diff --cached --quiet; then
+            echo "No EPUB changes to commit."
+          else
+            git commit -m "feat(epub): embed and validate covers (${SUMMARY}) [skip ci]"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+
+      - name: Upload report and log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: epub-cover-report
+          path: |
+            cover-report.json
+            cover-run.log
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Fail if any EPUB could not be processed
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          path = pathlib.Path("cover-report.json")
+          if not path.exists():
+              raise SystemExit("cover-report.json is missing")
+          report = json.loads(path.read_text(encoding="utf-8"))
+          errors = report["summary"]["errors"]
+          if errors:
+              for book in report["books"]:
+                  if book.get("error"):
+                      print(f'{book["file"]}: {book["error"]}', file=sys.stderr)
+              raise SystemExit(f"{errors} EPUB files failed")
+          print("All EPUB files processed and validated.")
+          PY
